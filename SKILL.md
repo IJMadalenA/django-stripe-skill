@@ -8,9 +8,13 @@ description: >-
   upgrading between dj-stripe versions. Also use when the system handles
   money, taxes, or user transactions that require precision, idempotency,
   and auditability.
+compatibility:
+  - python
+  - django
+  - dj-stripe
 ---
 
-# Django Stripe System Design
+# Django Stripe — Payment Systems with dj-stripe
 
 Comprehensive reference for building complete Stripe payment systems with Django
 and dj-stripe. Covers everything from initial architecture to production Go-Live.
@@ -19,21 +23,118 @@ and dj-stripe. Covers everything from initial architecture to production Go-Live
 your local database. Your code reads from the DB and writes to the Stripe API.
 Never modify synced records directly — always go through Stripe.
 
-## Quick Reference — Which File to Read
 
-| You need to...                                        | Read                           |
-| ----------------------------------------------------- | ------------------------------ |
-| Design the system from scratch                        | This file + `architecture.md`  |
-| Install and configure dj-stripe                       | `installation.md`              |
-| Understand models and relationships                   | `models.md`                    |
-| Handle webhooks reliably                              | `webhooks.md`                  |
-| Manage subscriptions and billing                      | `subscriptions.md`             |
-| Process payments, Checkout, payment methods           | `payments.md`                  |
-| Sync data between Stripe and local DB                 | `sync-and-data.md`             |
-| Secure API keys, webhooks, PCI compliance             | `security.md`                  |
-| Write tests (unit, integration, webhook)              | `testing.md`                   |
-| Upgrade dj-stripe between major versions              | `migrations.md`                |
-| Integrate with Stripe API (versioning, patterns)      | `stripe-api.md`                |
+## Overview
+
+dj-stripe syncs Stripe objects to your local Django database and dispatches webhook events via signal receivers. Stripe is the source of truth — your code writes to the Stripe API and reads from the synced local DB.
+
+**Current versions:** dj-stripe 2.x (stripe-python >= 11.0), Django >= 5.1, Python >= 3.11, PostgreSQL >= 12
+
+## Quick Navigation — Which File to Read
+
+| Task | Start Here |
+|---|---|
+| Design the system from scratch | `references/architecture.md` |
+| Install and configure dj-stripe | `references/installation.md` |
+| Understand models and relationships | `references/models.md` |
+| Handle webhooks reliably | `references/webhooks.md` |
+| Manage subscriptions and billing | `references/subscriptions.md` |
+| Process payments, Checkout, payment methods | `references/payments.md` |
+| Sync data between Stripe and local DB | `references/sync-and-data.md` |
+| Secure API keys, webhooks, PCI compliance | `references/security.md` |
+| Write tests (unit, integration, webhook) | `references/testing.md` |
+| Upgrade dj-stripe between major versions | `references/migrations.md` |
+| Integrate with Stripe API (versioning, patterns) | `references/stripe-api.md` |
+
+---
+
+## Critical Rules
+
+### Rule 1: Stripe is the source of truth
+
+The local database is a sync/cache copy. Write to the Stripe API, read from the local DB. **Never** modify synced dj-stripe model instances directly. **Never** create dj-stripe records outside of the sync/webhook path.
+
+### Rule 2: Webhooks drive all state changes
+
+Don't poll Stripe API for updates. All state synchronization comes through webhooks. Every handler must be idempotent — Stripe redelivers events and all handlers run in a single database transaction.
+
+```python
+from djstripe.event_handlers import djstripe_receiver
+
+@djstripe_receiver("checkout.session.completed")
+def handle_checkout_completed(sender, event, **kwargs):
+    session_data = event.data["object"]
+    customer = Customer.objects.get(id=session_data["customer"])
+    # Fulfill order — MUST be idempotent
+```
+
+### Rule 3: Register handlers in AppConfig.ready()
+
+```python
+class MyAppConfig(AppConfig):
+    def ready(self):
+        import myapp.webhooks  # imports trigger @djstripe_receiver registration
+```
+
+### Rule 4: PostgreSQL for production
+
+JSONField operations (`stripe_data` queries) require PostgreSQL. SQLite is acceptable for development only.
+
+### Rule 5: Never set STRIPE_API_VERSION
+
+dj-stripe pins this internally to its tested version (`2020-08-27`). Changing it breaks sync logic and model compatibility.
+
+### Rule 6: Stripe IDs as primary keys
+
+Always configure `DJSTRIPE_FOREIGN_KEY_TO_FIELD = "id"` in settings. This uses Stripe IDs (e.g., `cus_xxx`) as FK targets instead of internal auto-increment IDs.
+
+---
+
+## Quick Reference
+
+### Settings Configuration
+
+```python
+STRIPE_LIVE_SECRET_KEY = os.environ.get("STRIPE_LIVE_SECRET_KEY")
+STRIPE_TEST_SECRET_KEY = os.environ.get("STRIPE_TEST_SECRET_KEY")
+STRIPE_LIVE_MODE = False  # True in production
+DJSTRIPE_FOREIGN_KEY_TO_FIELD = "id"
+```
+```python
+INSTALLED_APPS = [
+    "djstripe",
+]
+urlpatterns = [
+    path("stripe/", include("djstripe.urls", namespace="djstripe")),
+]
+```
+
+### Customer & Checkout
+
+```python
+from djstripe.models import Customer
+import stripe
+
+customer, created = Customer.get_or_create(subscriber=user)
+
+checkout_session = stripe.checkout.Session.create(
+    mode="payment",  # payment | subscription | setup
+    line_items=[{"price": price_id, "quantity": 1}],
+    metadata={"djstripe_subscriber": user.id},
+    success_url=request.build_absolute_uri("/success/"),
+    cancel_url=request.build_absolute_uri("/cancel/"),
+)
+```
+
+### Subscription Management
+
+```python
+customer.subscribe(items=[{"price": price}], trial_period_days=30)
+customer.subscription.update(proration_behavior="none")
+customer.subscription.cancel(at_period_end=True)
+```
+
+---
 
 ## Design and Development Flow
 
@@ -204,6 +305,22 @@ See `testing.md` for test strategies, fixture management, and CI setup.
 - [ ] Stripe account in live mode with valid business info
 ```
 
+
+---
+
+## Common Mistakes (From Baseline Testing)
+
+- **Modifying synced records** → data lost on next webhook sync. Always go through Stripe API.
+- **Non-idempotent handlers** → duplicate fulfillment on retry. Use `event.idempotency_key` or deduplication checks.
+- **Installing jsonfield/jsonfield2 alongside dj-stripe >= 2.10** → `ImportError`. dj-stripe uses Django's native JSONField.
+- **Setting STRIPE_API_VERSION** → breaks sync. dj-stripe pins this internally.
+- **Using SQLite in production** → JSONField queries fail or behave differently.
+- **Hardcoding API keys in settings.py** → committed to git. Use environment variables.
+- **Forgetting AppConfig.ready() import** → handlers silently never register.
+- **Skipping versions when upgrading** → migrations depend on sequential path.
+- **Polling Stripe API for state** → race conditions. Use webhooks exclusively.
+- **Using internal PKs instead of Stripe IDs** → must set `DJSTRIPE_FOREIGN_KEY_TO_FIELD = "id"`.
+
 ---
 
 ## Architecture Principles
@@ -216,6 +333,20 @@ See `testing.md` for test strategies, fixture management, and CI setup.
 6. **Restricted keys for dj-stripe.** Principle of least privilege.
 7. **Never skip dj-stripe versions when upgrading.** Sequential migration path required.
 8. **Stripe IDs as primary keys.** Use `DJSTRIPE_FOREIGN_KEY_TO_FIELD = "id"`.
+
+
+---
+
+## Red Flags — STOP and Read the Reference
+
+| "I'll just update the Charge model directly" | No. Stripe is source of truth → `references/architecture.md` |
+| "SQLite is fine for production" | No. JSONField requires PostgreSQL → `references/installation.md` |
+| "I'll set STRIPE_API_VERSION to the latest" | No. dj-stripe pins this → `references/stripe-api.md` |
+| "The handler doesn't need to be idempotent" | It does → `references/webhooks.md` |
+| "I'll skip this version upgrade" | No. Every version required → `references/migrations.md` |
+| "I'll poll the API for subscription changes" | No. Use webhooks → `references/webhooks.md` |
+| "I'll hardcode the test secret key" | No. Use env vars → `references/security.md` |
+| "jsonfield package is fine alongside dj-stripe" | No. Causes ImportError → `references/installation.md` |
 
 ## Key Versions
 
